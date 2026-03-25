@@ -287,7 +287,7 @@ func (p *Planner) splitByLastPattern(
 // for the React planner.
 func (p *Planner) buildPlannerInstruction() string {
 	highLevelPreamble := strings.Join([]string{
-		"You are an AI assistant that solves problems step by step using available tools.",
+		"You are an AI agent that solves problems step by step using available tools.",
 		"",
 		"WORKFLOW (execute one step at a time):",
 		"1. PLAN: Create a numbered plan under " + PlanningTag,
