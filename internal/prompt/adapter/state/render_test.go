@@ -305,15 +305,15 @@ func TestRender_StateInjectionScenarios(t *testing.T) {
 			want:         "Hello alice from paris",
 		},
 		{
-			name:         "supported double brace unknown stays double brace",
+			name:         "supported double brace unknown normalizes to single brace",
 			template:     "Hello {{name}} from {{user:city}}",
 			sessionState: map[string]any{"name": "alice"},
-			want:         "Hello alice from {{user:city}}",
+			want:         "Hello alice from {user:city}",
 		},
 		{
-			name:     "unknown prefix double brace stays literal",
+			name:     "unknown prefix double brace normalized to single brace",
 			template: "Hello {{unknown:name}} and {{unknown:name?}}",
-			want:     "Hello {{unknown:name}} and {{unknown:name?}}",
+			want:     "Hello {unknown:name} and {unknown:name?}",
 		},
 		{
 			name:         "single brace whitespace stays literal",

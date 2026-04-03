@@ -26,7 +26,7 @@ func TestRender_PreservesSupportedDoubleBraceUnknowns(t *testing.T) {
 		t.Fatalf("Render: unexpected error: %v", err)
 	}
 
-	const want = "{{name}} {{unknown:name}} {{unknown:name?}} {{invalid-name}}"
+	const want = "{name} {unknown:name} {unknown:name?} {{invalid-name}}"
 	if rendered != want {
 		t.Fatalf("Render: got %q, want %q", rendered, want)
 	}

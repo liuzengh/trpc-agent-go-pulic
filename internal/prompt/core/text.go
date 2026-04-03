@@ -25,6 +25,10 @@ const (
 	// placeholders. In both forms, name itself matches the regexp
 	// `[^\s{}'"`?]+`. A trailing '?' marks the placeholder optional and is not
 	// part of name. Double-brace placeholders still ignore outer whitespace.
+	//
+	// Unresolved double-brace placeholders are normalized to single-brace
+	// form in the output (e.g. {{name}} becomes {name}). This preserves
+	// backward compatibility with the legacy state-injection pipeline.
 	SyntaxModeMixedBrace SyntaxMode = iota
 	// SyntaxModeSingleBrace recognizes placeholders such as {name} or {name?}.
 	//
@@ -85,6 +89,13 @@ type placeholderToken struct {
 	name     string
 	optional bool
 	accepted bool
+}
+
+func (t placeholderToken) optionalSuffix() string {
+	if t.optional {
+		return "?"
+	}
+	return ""
 }
 
 // Render replaces placeholders with values from env.
@@ -216,7 +227,22 @@ func scanPlaceholder(
 		}
 	case SyntaxModeMixedBrace:
 		if strings.HasPrefix(template[start:], "{{") {
-			return parseDoubleCurlyAt(template, start, cfg)
+			span, token := parseDoubleCurlyAt(template, start, cfg)
+			if token != nil {
+				if isMustacheCompatName(token.name) {
+					token.raw = "{" + token.name + token.optionalSuffix() + "}"
+				}
+				return span, token
+			}
+			// The double-brace parse matched delimiters but the inner
+			// content was not a valid placeholder name (e.g. {{{name}}}
+			// where inner="{name}" contains a forbidden char). Instead
+			// of consuming the entire span as a literal, consume only
+			// the first '{' so the next iteration can retry from the
+			// second '{'. This reproduces the legacy regex behavior
+			// where the mustache regex matched {{name}} inside
+			// {{{name}}}.
+			return 0, nil
 		}
 		if template[start] == '{' {
 			return parseSingleBraceAt(template, start, cfg)
@@ -372,6 +398,40 @@ func parseDoubleBraceName(inner string) (string, bool, bool) {
 		return "", false, false
 	}
 	return name, optional, true
+}
+
+// isMustacheCompatName reports whether name matches the legacy mustache
+// placeholder regex's capture pattern: an identifier optionally followed
+// by a colon and a second identifier. This determines whether a
+// double-brace placeholder should be normalized to single-brace form
+// in SyntaxModeMixedBrace mode for backward compatibility.
+func isMustacheCompatName(name string) bool {
+	parts := strings.SplitN(name, ":", 2)
+	if !isASCIIIdentifier(parts[0]) {
+		return false
+	}
+	if len(parts) == 2 {
+		return isASCIIIdentifier(parts[1])
+	}
+	return true
+}
+
+func isASCIIIdentifier(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		if i == 0 {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || r == '_') {
+				return false
+			}
+		} else {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_') {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func isValidName(name string) bool {

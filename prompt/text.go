@@ -44,6 +44,9 @@ const (
 	// forms, name itself matches the regexp `[^\s{}'"`?]+`. A trailing '?'
 	// marks the placeholder optional and is not part of name. Double-brace
 	// placeholders still ignore outer whitespace.
+	//
+	// Unresolved double-brace placeholders are normalized to single-brace
+	// form in the output (e.g. {{name}} becomes {name}).
 	SyntaxMixedBrace Syntax = iota
 	// SyntaxSingleBrace recognizes {name} placeholders only.
 	// Double-brace tokens such as {{name}} are treated as literal text.

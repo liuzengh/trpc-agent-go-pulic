@@ -168,7 +168,7 @@ func TestTextRender_DefaultMixedRecognizesBothDelimiters(t *testing.T) {
 	require.Equal(t, "hello alice from paris", rendered)
 }
 
-func TestTextRender_DefaultMixedPreservesUnresolvedDoubleBrace(t *testing.T) {
+func TestTextRender_DefaultMixedNormalizesUnresolvedDoubleBrace(t *testing.T) {
 	tpl := Text{
 		Template: "hello {{name}} from {{city}}",
 	}
@@ -180,10 +180,10 @@ func TestTextRender_DefaultMixedPreservesUnresolvedDoubleBrace(t *testing.T) {
 	})
 
 	require.NoError(t, err)
-	require.Equal(t, "hello alice from {{city}}", rendered)
+	require.Equal(t, "hello alice from {city}", rendered)
 }
 
-func TestTextRender_StrictUnknownPreservesDoubleBraceInOutputAndError(t *testing.T) {
+func TestTextRender_StrictUnknownNormalizesDoubleBraceInOutputAndError(t *testing.T) {
 	tpl := Text{
 		Template: "hello {{name}} from {{city}}",
 	}
@@ -197,9 +197,9 @@ func TestTextRender_StrictUnknownPreservesDoubleBraceInOutputAndError(t *testing
 		WithUnknownBehavior(ErrorOnUnknown),
 	)
 
-	require.Equal(t, "hello alice from {{city}}", rendered)
+	require.Equal(t, "hello alice from {city}", rendered)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "{{city}}")
+	require.Contains(t, err.Error(), "{city}")
 }
 
 func TestTextRender_DoubleBraceSyntax(t *testing.T) {
