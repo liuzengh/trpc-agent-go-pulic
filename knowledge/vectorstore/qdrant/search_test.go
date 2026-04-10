@@ -83,6 +83,23 @@ func TestSearch(t *testing.T) {
 			})
 		}
 	})
+
+	t.Run("invalid mode falls back to vector search", func(t *testing.T) {
+		mock := newMockClient()
+		mock.QueryFn = func(ctx context.Context, req *qdrant.QueryPoints) ([]*qdrant.ScoredPoint, error) {
+			return []*qdrant.ScoredPoint{}, nil
+		}
+		vs := newTestVectorStore(mock)
+
+		result, err := vs.Search(context.Background(), &vectorstore.SearchQuery{
+			SearchMode: vectorstore.SearchMode(99),
+			Vector:     make([]float64, testDimension),
+		})
+
+		require.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.Equal(t, 1, mock.queryCalls)
+	})
 }
 
 func TestSearchByVector(t *testing.T) {

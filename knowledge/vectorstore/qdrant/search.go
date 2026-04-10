@@ -15,9 +15,11 @@ import (
 
 	"github.com/qdrant/go-client/qdrant"
 
+	"trpc.group/trpc-go/trpc-agent-go/internal/retrieval"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/searchfilter"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/source"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore"
+	isearch "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/internal/search"
 )
 
 // Search performs similarity search.
@@ -26,16 +28,72 @@ func (vs *VectorStore) Search(ctx context.Context, query *vectorstore.SearchQuer
 		return nil, errQueryRequired
 	}
 
-	switch query.SearchMode {
-	case vectorstore.SearchModeFilter:
-		return vs.searchByFilter(ctx, query)
-	case vectorstore.SearchModeKeyword:
-		return vs.searchByKeyword(ctx, query)
-	case vectorstore.SearchModeHybrid:
-		return vs.searchByHybrid(ctx, query)
+	effectiveQuery := *query
+	switch effectiveQuery.SearchMode {
+	case vectorstore.SearchModeVector,
+		vectorstore.SearchModeKeyword,
+		vectorstore.SearchModeHybrid,
+		vectorstore.SearchModeFilter:
 	default:
-		return vs.searchByVector(ctx, query)
+		effectiveQuery.SearchMode = vectorstore.SearchModeVector
 	}
+
+	modePipeline := &isearch.ModePipeline{
+		Vector: isearch.NewVectorBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				result, err := vs.searchByVector(ctx, req.Query)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+		Keyword: isearch.NewKeywordBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				result, err := vs.searchByKeyword(ctx, req.Query)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+		Hybrid: isearch.NewHybridBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				result, err := vs.searchByHybrid(ctx, req.Query)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+		Filter: isearch.NewFilterBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				result, err := vs.searchByFilter(ctx, req.Query)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+	}
+
+	return isearch.Run(ctx, modePipeline, &effectiveQuery)
 }
 
 // searchByVector performs dense vector similarity search.

@@ -20,9 +20,11 @@ import (
 
 	"github.com/pgvector/pgvector-go"
 	"trpc.group/trpc-go/trpc-agent-go/event"
+	"trpc.group/trpc-go/trpc-agent-go/internal/retrieval"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/model"
 	"trpc.group/trpc-go/trpc-agent-go/session"
+	isearch "trpc.group/trpc-go/trpc-agent-go/session/internal/search"
 )
 
 // SearchEvents implements session.SearchableService.
@@ -80,11 +82,28 @@ func (s *Service) SearchEvents(
 	}
 
 	vector := pgvector.NewVector(toFloat32(qEmb))
+	searchReq := isearch.Request{
+		Search: req,
+		Query:  query,
+	}
 
 	if req.SearchMode == session.SearchModeDense {
-		return s.executeDenseSearch(
-			searchCtx, req, vector, topK,
+		denseBranch := isearch.NewDenseBranch(
+			retrieval.ChannelFunc[isearch.Request, session.EventSearchResult](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[session.EventSearchResult], error) {
+				results, err := s.executeDenseSearch(
+					ctx, req.Search, vector, topK,
+				)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromResults(results), nil
+			}),
+			isearch.TopKPostprocessor{MaxResults: topK},
 		)
+		return isearch.Run(searchCtx, denseBranch, searchReq)
 	}
 
 	candidateLimit := resolveHybridCandidateLimit(
@@ -92,23 +111,6 @@ func (s *Service) SearchEvents(
 		req.HybridCandidateRatio,
 		s.opts.candidateRatio,
 	)
-	denseResults, err := s.executeDenseSearch(
-		searchCtx, req, vector, candidateLimit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	keywordResults, err := s.executeKeywordSearch(
-		searchCtx, req, query, candidateLimit,
-	)
-	if err != nil {
-		log.WarnfContext(
-			ctx,
-			"session pgvector keyword search failed, fallback to dense only: %v",
-			err,
-		)
-		return truncateEventSearchResults(denseResults, topK), nil
-	}
 	rrfK := req.HybridRRFK
 	if rrfK <= 0 {
 		rrfK = s.opts.hybridRRFK
@@ -116,12 +118,49 @@ func (s *Service) SearchEvents(
 	if rrfK <= 0 {
 		rrfK = defaultHybridRRFK
 	}
-	return mergeHybridEventResults(
-		denseResults,
-		keywordResults,
-		rrfK,
-		topK,
-	), nil
+
+	denseBranch := isearch.NewDenseBranch(
+		retrieval.ChannelFunc[isearch.Request, session.EventSearchResult](func(
+			ctx context.Context,
+			req isearch.Request,
+		) ([]retrieval.Hit[session.EventSearchResult], error) {
+			results, err := s.executeDenseSearch(
+				ctx, req.Search, vector, candidateLimit,
+			)
+			if err != nil {
+				return nil, err
+			}
+			return isearch.HitsFromResults(results), nil
+		}),
+	)
+	keywordBranch := isearch.NewKeywordBranch(
+		retrieval.ChannelFunc[isearch.Request, session.EventSearchResult](func(
+			ctx context.Context,
+			req isearch.Request,
+		) ([]retrieval.Hit[session.EventSearchResult], error) {
+			results, err := s.executeKeywordSearch(
+				ctx, req.Search, req.Query, candidateLimit,
+			)
+			if err != nil {
+				log.WarnfContext(
+					ctx,
+					"session pgvector keyword search failed, fallback to dense only: %v",
+					err,
+				)
+				return []retrieval.Hit[session.EventSearchResult]{}, nil
+			}
+			return isearch.HitsFromResults(results), nil
+		}),
+	)
+	hybridPipeline := isearch.NewHybridPipeline(
+		[]retrieval.NamedPipeline[isearch.Request, session.EventSearchResult]{
+			{Name: "dense", Pipeline: denseBranch},
+			{Name: "keyword", Pipeline: keywordBranch},
+		},
+		isearch.RRFFusion{K: rrfK},
+		isearch.TopKPostprocessor{MaxResults: topK},
+	)
+	return isearch.Run(searchCtx, hybridPipeline, searchReq)
 }
 
 func (s *Service) executeDenseSearch(

@@ -22,10 +22,12 @@ import (
 	"time"
 
 	"github.com/pgvector/pgvector-go"
+	"trpc.group/trpc-go/trpc-agent-go/internal/retrieval"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/searchfilter"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/source"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore"
+	isearch "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/internal/search"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	"trpc.group/trpc-go/trpc-agent-go/storage/postgres"
 )
@@ -374,31 +376,79 @@ func (vs *VectorStore) Search(ctx context.Context, query *vectorstore.SearchQuer
 		return nil, errors.New("pgvector: query is required")
 	}
 
+	effectiveQuery := *query
 	if !vs.option.enableTSVector &&
-		(query.SearchMode == vectorstore.SearchModeKeyword ||
-			query.SearchMode == vectorstore.SearchModeHybrid) {
+		(effectiveQuery.SearchMode == vectorstore.SearchModeKeyword ||
+			effectiveQuery.SearchMode == vectorstore.SearchModeHybrid) {
 		log.InfofContext(ctx,
 			"pgvector: keyword or hybrid search is not supported when enableTSVector "+
 				"is disabled, use filter/vector search instead")
-		if len(query.Vector) > 0 {
-			return vs.searchByVector(ctx, query)
+		if len(effectiveQuery.Vector) > 0 {
+			effectiveQuery.SearchMode = vectorstore.SearchModeVector
+		} else {
+			effectiveQuery.SearchMode = vectorstore.SearchModeFilter
 		}
-		return vs.searchByFilter(ctx, query)
 	}
 
-	// default is hybrid search
-	switch query.SearchMode {
-	case vectorstore.SearchModeVector:
-		return vs.searchByVector(ctx, query)
-	case vectorstore.SearchModeKeyword:
-		return vs.searchByKeyword(ctx, query)
-	case vectorstore.SearchModeHybrid:
-		return vs.searchByHybrid(ctx, query)
-	case vectorstore.SearchModeFilter:
-		return vs.searchByFilter(ctx, query)
-	default:
-		return nil, fmt.Errorf("pgvector: invalid search mode: %d", query.SearchMode)
+	modePipeline := &isearch.ModePipeline{
+		Vector: isearch.NewVectorBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				result, err := vs.searchByVector(ctx, req.Query)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+		Keyword: isearch.NewKeywordBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				result, err := vs.searchByKeyword(ctx, req.Query)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+		Hybrid: isearch.NewHybridBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				result, err := vs.searchByHybrid(ctx, req.Query)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+		Filter: isearch.NewFilterBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				result, err := vs.searchByFilter(ctx, req.Query)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+		InvalidMode: func(mode vectorstore.SearchMode) error {
+			return fmt.Errorf("pgvector: invalid search mode: %d", mode)
+		},
 	}
+
+	return isearch.Run(ctx, modePipeline, &effectiveQuery)
 }
 
 // searchByVector performs pure vector similarity search

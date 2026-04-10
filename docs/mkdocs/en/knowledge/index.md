@@ -23,6 +23,8 @@ This pattern provides:
 - **Knowledge Filtering**: Support for static filtering and Agent intelligent filtering via metadata
 - **Extensible Architecture**: Support for custom Embedder, Retriever, and Reranker
 
+For the internal execution path and ownership boundaries of the retrieval stack, see [Retrieval Layering](retrieval.md).
+
 ### Agent Integration
 
 Ways to integrate the Knowledge system with Agents:

@@ -79,6 +79,8 @@ for i, r := range rspSearchWithFilter.Documents {
 
 All vector stores support filter functionality, including ID filtering, metadata filtering, and complex condition filtering (`FilterCondition`).
 
+For the internal mode-routing layer that now sits between `VectorStore.Search()` and backend `searchBy*` functions, see [Retrieval Layering](../retrieval.md).
+
 ## More Content
 
 - [Memory](inmemory.md) - In-memory vector store configuration

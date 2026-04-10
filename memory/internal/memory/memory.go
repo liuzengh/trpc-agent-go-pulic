@@ -11,6 +11,7 @@
 package memory
 
 import (
+	"context"
 	"crypto/sha256"
 	"fmt"
 	"math"
@@ -23,8 +24,10 @@ import (
 	"unicode/utf8"
 
 	"github.com/go-ego/gse"
+	"trpc.group/trpc-go/trpc-agent-go/internal/retrieval"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
 	"trpc.group/trpc-go/trpc-agent-go/memory/extractor"
+	isearch "trpc.group/trpc-go/trpc-agent-go/memory/internal/search"
 	memorytool "trpc.group/trpc-go/trpc-agent-go/memory/tool"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
@@ -1253,6 +1256,7 @@ func SearchEntries(
 	if query == "" {
 		return []*memory.Entry{}
 	}
+	opts.Query = query
 
 	limit := defaultMaxResults
 	if opts.MaxResults > 0 {
@@ -1264,24 +1268,42 @@ func SearchEntries(
 		threshold = opts.SimilarityThreshold
 	}
 
-	candidates := scoreEntries(entries, query, threshold)
-	filtered := filterAndSortEntries(candidates, opts)
-	results := cloneScoredEntries(filtered)
+	request := isearch.Request{Options: opts}
+	keywordBranch := isearch.NewKeywordBranch(
+		retrieval.ChannelFunc[isearch.Request, *memory.Entry](func(
+			_ context.Context,
+			req isearch.Request,
+		) ([]retrieval.Hit[*memory.Entry], error) {
+			candidates := scoreEntries(entries, req.Options.Query, threshold)
+			filtered := filterAndSortEntries(candidates, req.Options)
+			return isearch.HitsFromEntries(cloneScoredEntries(filtered)), nil
+		}),
+	)
 
-	if opts.Kind != "" && opts.KindFallback &&
-		len(results) < MinKindFallbackResults {
-		fallbackOpts := opts
-		fallbackOpts.Kind = ""
-		fallbackOpts.KindFallback = false
-		fallback := cloneScoredEntries(filterAndSortEntries(candidates, fallbackOpts))
-		results = MergeSearchResults(results, fallback, opts.Kind, limit)
+	postprocessors := []retrieval.Postprocessor[isearch.Request, *memory.Entry]{
+		isearch.DeduplicatePostprocessor{DeduplicateFunc: DeduplicateResults},
+		isearch.TopKPostprocessor{MaxResults: limit},
 	}
 
-	if opts.Deduplicate && len(results) > 1 {
-		results = DeduplicateResults(results)
+	var pipeline retrieval.Pipeline[isearch.Request, *memory.Entry] = keywordBranch
+	if opts.Kind != "" && opts.KindFallback {
+		pipeline = isearch.NewKindFallbackPipeline(
+			keywordBranch,
+			keywordBranch,
+			isearch.KindFallbackPolicy{MinResults: MinKindFallbackResults},
+			isearch.KindFallbackMerger{
+				MaxResults: limit,
+				MergeFunc:  MergeSearchResults,
+			},
+			postprocessors...,
+		)
+	} else {
+		keywordBranch.Post = postprocessors
 	}
-	if limit > 0 && len(results) > limit {
-		results = results[:limit]
+
+	results, err := isearch.Run(context.Background(), pipeline, request)
+	if err != nil {
+		return []*memory.Entry{}
 	}
 	return results
 }

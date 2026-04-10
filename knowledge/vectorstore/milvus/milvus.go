@@ -24,10 +24,12 @@ import (
 	client "github.com/milvus-io/milvus/client/v2/milvusclient"
 
 	internalknowledge "trpc.group/trpc-go/trpc-agent-go/internal/knowledge"
+	"trpc.group/trpc-go/trpc-agent-go/internal/retrieval"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/searchfilter"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/source"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore"
+	isearch "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/internal/search"
 	"trpc.group/trpc-go/trpc-agent-go/storage/milvus"
 )
 
@@ -323,31 +325,85 @@ func (vs *VectorStore) Search(ctx context.Context, query *vectorstore.SearchQuer
 		return nil, errQueryRequired
 	}
 
-	switch query.SearchMode {
-	case vectorstore.SearchModeVector:
-		if len(query.Vector) == 0 {
-			return nil, errors.New("milvus: vector is required for vector search mode")
-		}
-		return vs.searchByVector(ctx, query)
-	case vectorstore.SearchModeKeyword:
-		if query.Query == "" {
-			return nil, errors.New("milvus: query text is required for keyword search mode")
-		}
-		return vs.searchByKeyword(ctx, query)
-	case vectorstore.SearchModeHybrid:
-		if len(query.Vector) == 0 || query.Query == "" {
-			return nil, errors.New("milvus: both vector and query text are required for hybrid search mode")
-		}
-		return vs.searchByHybrid(ctx, query)
-	case vectorstore.SearchModeFilter:
-		return vs.searchByFilter(ctx, query)
+	effectiveQuery := *query
+	switch effectiveQuery.SearchMode {
+	case vectorstore.SearchModeVector,
+		vectorstore.SearchModeKeyword,
+		vectorstore.SearchModeHybrid,
+		vectorstore.SearchModeFilter:
 	default:
-		// Default behavior: use vector search if vector is provided, otherwise filter search
-		if len(query.Vector) > 0 {
-			return vs.searchByVector(ctx, query)
+		if len(effectiveQuery.Vector) > 0 {
+			effectiveQuery.SearchMode = vectorstore.SearchModeVector
+		} else {
+			effectiveQuery.SearchMode = vectorstore.SearchModeFilter
 		}
-		return vs.searchByFilter(ctx, query)
 	}
+
+	modePipeline := &isearch.ModePipeline{
+		Vector: isearch.NewVectorBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				if len(req.Query.Vector) == 0 {
+					return nil, errors.New("milvus: vector is required for vector search mode")
+				}
+				result, err := vs.searchByVector(ctx, req.Query)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+		Keyword: isearch.NewKeywordBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				if req.Query.Query == "" {
+					return nil, errors.New("milvus: query text is required for keyword search mode")
+				}
+				result, err := vs.searchByKeyword(ctx, req.Query)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+		Hybrid: isearch.NewHybridBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				if len(req.Query.Vector) == 0 || req.Query.Query == "" {
+					return nil, errors.New("milvus: both vector and query text are required for hybrid search mode")
+				}
+				result, err := vs.searchByHybrid(ctx, req.Query)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+		Filter: isearch.NewFilterBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				result, err := vs.searchByFilter(ctx, req.Query)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+	}
+
+	return isearch.Run(ctx, modePipeline, &effectiveQuery)
 }
 
 // searchByVector performs vector similarity search.

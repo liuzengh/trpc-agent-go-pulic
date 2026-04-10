@@ -21,8 +21,10 @@ import (
 
 	"github.com/lib/pq"
 	"github.com/pgvector/pgvector-go"
+	"trpc.group/trpc-go/trpc-agent-go/internal/retrieval"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
 	imemory "trpc.group/trpc-go/trpc-agent-go/memory/internal/memory"
+	isearch "trpc.group/trpc-go/trpc-agent-go/memory/internal/search"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	storage "trpc.group/trpc-go/trpc-agent-go/storage/postgres"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
@@ -571,77 +573,119 @@ func (s *Service) SearchMemories(
 	if opts.MaxResults > 0 {
 		maxResults = opts.MaxResults
 	}
-
-	results, err := s.executeVectorSearch(ctx, userKey, opts, vector, maxResults)
-	if err != nil {
-		return nil, err
-	}
-
-	// Kind fallback: when kind filter was applied but returned too few
-	// results, retry without the kind filter and merge both result sets.
-	if opts.Kind != "" && opts.KindFallback && len(results) < minKindFallbackResults {
-		fallbackOpts := opts
-		fallbackOpts.Kind = ""
-		fallbackOpts.KindFallback = false
-		fallbackResults, fallbackErr := s.executeVectorSearch(
-			ctx, userKey, fallbackOpts, vector, maxResults,
-		)
-		if fallbackErr == nil && len(fallbackResults) > 0 {
-			results = mergeSearchResults(results, fallbackResults, opts.Kind, maxResults)
-		}
-	}
-
-	// Hybrid search: run keyword search and merge with vector results
-	// using Reciprocal Rank Fusion (RRF) to improve recall for exact
-	// entity names, book titles, etc.
-	if opts.HybridSearch {
-		keywordResults, kwErr := s.executeKeywordSearch(ctx, userKey, opts, maxResults)
-		if kwErr == nil && len(keywordResults) > 0 {
-			rrfK := opts.HybridRRFK
-			if rrfK <= 0 {
-				rrfK = defaultRRFK
-			}
-			results = mergeHybridResults(results, keywordResults, rrfK, maxResults)
-		}
-	}
-
-	// Apply similarity threshold filtering.
-	// Skip when hybrid search is active because RRF scores use a
-	// different range than cosine similarity.
 	threshold := s.opts.similarityThreshold
 	if opts.SimilarityThreshold > 0 {
 		threshold = opts.SimilarityThreshold
 	}
-	if threshold > 0 && len(results) > 0 && !opts.HybridSearch {
-		filtered := results[:0]
-		for _, r := range results {
-			if r.Score >= threshold {
-				filtered = append(filtered, r)
-			}
-		}
-		results = filtered
+	request := isearch.Request{
+		UserKey: userKey,
+		Options: opts,
 	}
-	if len(results) > 1 {
-		if opts.Kind != "" && opts.KindFallback {
-			imemory.SortSearchResultsWithKindPriority(
-				results,
-				opts.Kind,
-				opts.OrderByEventTime,
+
+	denseBranch := isearch.NewDenseBranch(
+		retrieval.ChannelFunc[isearch.Request, *memory.Entry](func(
+			ctx context.Context,
+			req isearch.Request,
+		) ([]retrieval.Hit[*memory.Entry], error) {
+			results, err := s.executeVectorSearch(
+				ctx,
+				req.UserKey,
+				req.Options,
+				vector,
+				maxResults,
 			)
-		} else {
-			imemory.SortSearchResults(results, opts.OrderByEventTime)
-		}
+			if err != nil {
+				return nil, err
+			}
+			return isearch.HitsFromEntries(results), nil
+		}),
+	)
+
+	postprocessors := []retrieval.Postprocessor[isearch.Request, *memory.Entry]{
+		isearch.ThresholdPostprocessor{
+			SimilarityThreshold: threshold,
+			Skip:                opts.HybridSearch,
+		},
+	}
+	if opts.Kind != "" && opts.KindFallback {
+		postprocessors = append(postprocessors,
+			isearch.KindPrioritySortPostprocessor{
+				PreferredKind:    opts.Kind,
+				OrderByEventTime: opts.OrderByEventTime,
+			},
+		)
+	} else {
+		postprocessors = append(postprocessors, isearch.SortPostprocessor{
+			OrderByEventTime: opts.OrderByEventTime,
+		})
+	}
+	postprocessors = append(postprocessors,
+		isearch.DeduplicatePostprocessor{DeduplicateFunc: deduplicateResults},
+		isearch.TopKPostprocessor{MaxResults: maxResults},
+	)
+
+	var pipeline retrieval.Pipeline[isearch.Request, *memory.Entry] = denseBranch
+	if opts.Kind != "" && opts.KindFallback {
+		pipeline = isearch.NewKindFallbackPipeline(
+			denseBranch,
+			denseBranch,
+			isearch.KindFallbackPolicy{MinResults: minKindFallbackResults},
+			isearch.KindFallbackMerger{
+				MaxResults: maxResults,
+				MergeFunc:  mergeSearchResults,
+			},
+		)
 	}
 
-	// Content-based deduplication of near-identical memories.
-	if opts.Deduplicate && len(results) > 1 {
-		results = deduplicateResults(results)
-	}
-	if maxResults > 0 && len(results) > maxResults {
-		results = results[:maxResults]
+	if opts.HybridSearch {
+		keywordBranch := isearch.NewKeywordBranch(
+			retrieval.ChannelFunc[isearch.Request, *memory.Entry](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*memory.Entry], error) {
+				results, err := s.executeKeywordSearch(
+					ctx,
+					req.UserKey,
+					req.Options,
+					maxResults,
+				)
+				if err != nil {
+					return []retrieval.Hit[*memory.Entry]{}, nil
+				}
+				return isearch.HitsFromEntries(results), nil
+			}),
+		)
+		pipeline = isearch.NewHybridPipeline(
+			[]retrieval.NamedPipeline[isearch.Request, *memory.Entry]{
+				{Name: "dense", Pipeline: pipeline},
+				{Name: "keyword", Pipeline: keywordBranch},
+			},
+			isearch.RRFFusion{
+				K:          opts.HybridRRFK,
+				MaxResults: maxResults,
+				FuseFunc: func(
+					primary []*memory.Entry,
+					secondary []*memory.Entry,
+					k int,
+					maxResults int,
+				) []*memory.Entry {
+					if len(secondary) == 0 {
+						return primary
+					}
+					return mergeHybridResults(primary, secondary, k, maxResults)
+				},
+			},
+			postprocessors...,
+		)
+	} else if fallbackPipeline, ok := pipeline.(*retrieval.FallbackPipeline[
+		isearch.Request, *memory.Entry,
+	]); ok {
+		fallbackPipeline.Post = postprocessors
+	} else {
+		denseBranch.Post = postprocessors
 	}
 
-	return results, nil
+	return isearch.Run(ctx, pipeline, request)
 }
 
 // executeVectorSearch runs a single vector similarity search against pgvector.

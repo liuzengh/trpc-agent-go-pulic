@@ -21,10 +21,12 @@ import (
 	"sync"
 	"time"
 
+	"trpc.group/trpc-go/trpc-agent-go/internal/retrieval"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/searchfilter"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/source"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore"
+	isearch "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/internal/search"
 )
 
 var _ vectorstore.VectorStore = (*Store)(nil)
@@ -335,22 +337,71 @@ func (s *Store) Search(ctx context.Context, query *vectorstore.SearchQuery) (*ve
 		return nil, errors.New("sqlitevec search: query cannot be nil")
 	}
 
-	switch query.SearchMode {
-	case vectorstore.SearchModeVector:
-		return s.searchByVector(ctx, query)
-	case vectorstore.SearchModeFilter:
-		return s.searchByFilter(ctx, query)
-	case vectorstore.SearchModeKeyword:
-		return nil, errors.New("sqlitevec: SearchModeKeyword is not supported in v1")
-	case vectorstore.SearchModeHybrid:
-		return s.searchByVector(ctx, query)
+	effectiveQuery := *query
+	switch effectiveQuery.SearchMode {
+	case vectorstore.SearchModeVector,
+		vectorstore.SearchModeFilter,
+		vectorstore.SearchModeKeyword,
+		vectorstore.SearchModeHybrid:
 	default:
-		// Default to vector search for backward compatibility.
-		if len(query.Vector) > 0 {
-			return s.searchByVector(ctx, query)
+		if len(effectiveQuery.Vector) > 0 {
+			effectiveQuery.SearchMode = vectorstore.SearchModeVector
+		} else {
+			effectiveQuery.SearchMode = vectorstore.SearchModeFilter
 		}
-		return s.searchByFilter(ctx, query)
 	}
+
+	modePipeline := &isearch.ModePipeline{
+		Vector: isearch.NewVectorBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				result, err := s.searchByVector(ctx, req.Query)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+		Filter: isearch.NewFilterBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				result, err := s.searchByFilter(ctx, req.Query)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+		Hybrid: isearch.NewHybridBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				result, err := s.searchByVector(ctx, req.Query)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+		Keyword: isearch.NewKeywordBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				return nil, errors.New("sqlitevec: SearchModeKeyword is not supported in v1")
+			}),
+		),
+	}
+
+	return isearch.Run(ctx, modePipeline, &effectiveQuery)
 }
 
 // searchByVector performs vector similarity search with optional filters.

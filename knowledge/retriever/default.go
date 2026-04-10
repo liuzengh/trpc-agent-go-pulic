@@ -12,7 +12,10 @@ package retriever
 import (
 	"context"
 
+	"trpc.group/trpc-go/trpc-agent-go/internal/retrieval"
+	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/embedder"
+	isearch "trpc.group/trpc-go/trpc-agent-go/knowledge/internal/search"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/query"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/reranker"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore"
@@ -70,99 +73,55 @@ func New(opts ...Option) *DefaultRetriever {
 
 // Retrieve implements the Retriever interface by executing the complete RAG pipeline.
 func (dr *DefaultRetriever) Retrieve(ctx context.Context, q *Query) (*Result, error) {
-	// Step 1: Enhance query (if enhancer is available).
-	finalQuery := q.Text
-	if dr.queryEnhancer != nil {
-		// Create query request with full context.
-		// No conversion needed as both use the same type from query package
-		queryReq := &query.Request{
-			Query:     q.Text,
-			History:   q.History,
-			UserID:    q.UserID,
-			SessionID: q.SessionID,
-		}
-		enhanced, err := dr.queryEnhancer.EnhanceQuery(ctx, queryReq)
-		if err != nil {
-			return nil, err
-		}
-		finalQuery = enhanced.Enhanced
+	var filter *vectorstore.SearchFilter
+	if q.Filter != nil {
+		filter = isearch.ResolveFilter(q.Filter.DocumentIDs, q.Filter.Metadata, q.Filter.FilterCondition)
+	}
+	req := isearch.ResolveRequest(
+		q.Text,
+		q.History,
+		q.UserID,
+		q.SessionID,
+		q.Limit,
+		q.MinScore,
+		filter,
+		vectorstore.SearchMode(q.SearchMode),
+	)
+
+	var rerankerAdapter retrieval.Reranker[isearch.Request, *document.Document]
+	if dr.reranker != nil {
+		rerankerAdapter = isearch.RerankerAdapter{Reranker: dr.reranker}
 	}
 
-	// Step 2: Generate embedding.
-	var embedding []float64
-	if dr.embedder != nil && finalQuery != "" {
-		var err error
-		embedding, err = dr.embedder.GetEmbedding(ctx, finalQuery)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// Step 3: Search vector store.
-	searchResults, err := dr.vectorStore.Search(ctx, &vectorstore.SearchQuery{
-		Query:      finalQuery,
-		Vector:     embedding,
-		Limit:      q.Limit,
-		MinScore:   q.MinScore,
-		Filter:     convertQueryFilter(q.Filter),
-		SearchMode: q.SearchMode,
-	})
+	branch := isearch.NewBranch(
+		isearch.EnhanceAndEmbedRewriter{
+			Enhancer: dr.queryEnhancer,
+			Embedder: dr.embedder,
+		},
+		isearch.VectorStoreChannel{VectorStore: dr.vectorStore},
+		rerankerAdapter,
+		isearch.TopKPostprocessor{},
+	)
+	results, err := isearch.Run(ctx, branch, req)
 	if err != nil {
 		return nil, err
 	}
 
-	// Step 4: Convert to reranker format.
-	rerankerResults := make([]*reranker.Result, len(searchResults.Results))
-	for i, doc := range searchResults.Results {
-		rerankerResults[i] = &reranker.Result{
-			Document: doc.Document,
-			Score:    doc.Score,
+	finalResults := make([]*RelevantDocument, 0, len(results))
+	for _, result := range results {
+		if result == nil {
+			continue
 		}
-	}
-
-	// Step 5: Rerank results (if reranker is available).
-	if dr.reranker != nil {
-		rerankerResults, err = dr.reranker.Rerank(ctx, &reranker.Query{
-			Text:       q.Text,
-			FinalQuery: finalQuery,
-			History:    q.History,
-			UserID:     q.UserID,
-			SessionID:  q.SessionID,
-		}, rerankerResults)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// Step 6: Convert back to retriever format.
-	finalResults := make([]*RelevantDocument, len(rerankerResults))
-	for i, result := range rerankerResults {
-		finalResults[i] = &RelevantDocument{
+		finalResults = append(finalResults, &RelevantDocument{
 			Document: result.Document,
 			Score:    result.Score,
-		}
+		})
 	}
-
-	return &Result{
-		Documents: finalResults,
-	}, nil
+	return &Result{Documents: finalResults}, nil
 }
 
 // Close implements the Retriever interface.
 func (dr *DefaultRetriever) Close() error {
 	// Close components if they support closing.
 	return nil
-}
-
-// convertQueryFilter converts retriever.QueryFilter to vectorstore.SearchFilter.
-func convertQueryFilter(qf *QueryFilter) *vectorstore.SearchFilter {
-	if qf == nil {
-		return nil
-	}
-
-	return &vectorstore.SearchFilter{
-		IDs:             qf.DocumentIDs,
-		Metadata:        qf.Metadata,
-		FilterCondition: qf.FilterCondition,
-	}
 }

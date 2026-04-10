@@ -14,9 +14,11 @@ import (
 	"testing"
 
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
+	isearch "trpc.group/trpc-go/trpc-agent-go/knowledge/internal/search"
 	q "trpc.group/trpc-go/trpc-agent-go/knowledge/query"
 	r "trpc.group/trpc-go/trpc-agent-go/knowledge/reranker"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/reranker/topk"
+	"trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/inmemory"
 )
 
@@ -429,8 +431,8 @@ func TestDefaultRetriever_WithMinScore(t *testing.T) {
 	}
 }
 
-// TestConvertQueryFilter tests the filter conversion function.
-func TestConvertQueryFilter(t *testing.T) {
+// TestResolveFilter tests the filter adapter used by the retriever.
+func TestResolveFilter(t *testing.T) {
 	tests := []struct {
 		name   string
 		input  *QueryFilter
@@ -467,7 +469,10 @@ func TestConvertQueryFilter(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := convertQueryFilter(tt.input)
+			var result *vectorstore.SearchFilter
+			if tt.input != nil {
+				result = isearch.ResolveFilter(tt.input.DocumentIDs, tt.input.Metadata, tt.input.FilterCondition)
+			}
 			if tt.expect && result == nil {
 				t.Error("expected non-nil result")
 			}

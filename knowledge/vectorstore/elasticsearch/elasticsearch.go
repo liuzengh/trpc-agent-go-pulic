@@ -22,10 +22,12 @@ import (
 	"github.com/elastic/go-elasticsearch/v9/typedapi/types/enums/densevectorsimilarity"
 	"github.com/elastic/go-elasticsearch/v9/typedapi/types/enums/dynamicmapping"
 
+	"trpc.group/trpc-go/trpc-agent-go/internal/retrieval"
 	istorage "trpc.group/trpc-go/trpc-agent-go/internal/storage/elasticsearch"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/searchfilter"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore"
+	isearch "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/internal/search"
 	"trpc.group/trpc-go/trpc-agent-go/log"
 	storage "trpc.group/trpc-go/trpc-agent-go/storage/elasticsearch"
 )
@@ -335,55 +337,107 @@ func (vs *VectorStore) Search(ctx context.Context, query *vectorstore.SearchQuer
 	if query == nil {
 		return nil, errors.New("elasticsearch search query cannot be nil")
 	}
-
-	// Build search query based on search mode.
-	var searchQuery *types.SearchRequestBody
-	var err error
-
-	switch query.SearchMode {
-	case vectorstore.SearchModeVector:
-		searchQuery, err = vs.buildVectorSearchQuery(query)
-	case vectorstore.SearchModeKeyword:
-		if !vs.option.enableTSVector {
+	effectiveQuery := *query
+	switch effectiveQuery.SearchMode {
+	case vectorstore.SearchModeVector,
+		vectorstore.SearchModeKeyword,
+		vectorstore.SearchModeHybrid,
+		vectorstore.SearchModeFilter:
+	default:
+		effectiveQuery.SearchMode = vectorstore.SearchModeVector
+	}
+	if !vs.option.enableTSVector {
+		switch effectiveQuery.SearchMode {
+		case vectorstore.SearchModeKeyword:
 			log.InfofContext(
 				ctx,
 				"elasticsearch: keyword search is not supported "+
 					"when enableTSVector is disabled, use vector "+
 					"search instead",
 			)
-			searchQuery, err = vs.buildVectorSearchQuery(query)
-		} else {
-			searchQuery, err = vs.buildKeywordSearchQuery(query)
-		}
-	case vectorstore.SearchModeHybrid:
-		if !vs.option.enableTSVector {
+			effectiveQuery.SearchMode = vectorstore.SearchModeVector
+		case vectorstore.SearchModeHybrid:
 			log.InfofContext(
 				ctx,
 				"elasticsearch: hybrid search is not supported "+
 					"when enableTSVector is disabled, use vector "+
 					"search instead",
 			)
-			searchQuery, err = vs.buildVectorSearchQuery(query)
-		} else {
-			searchQuery, err = vs.buildHybridSearchQuery(query)
+			effectiveQuery.SearchMode = vectorstore.SearchModeVector
 		}
-	case vectorstore.SearchModeFilter:
-		searchQuery, err = vs.buildFilterSearchQuery(query)
-	default:
-		searchQuery, err = vs.buildVectorSearchQuery(query)
 	}
 
+	modePipeline := &isearch.ModePipeline{
+		Vector: isearch.NewVectorBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				result, err := vs.searchWithBuilder(ctx, req.Query, vs.buildVectorSearchQuery)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+		Keyword: isearch.NewKeywordBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				result, err := vs.searchWithBuilder(ctx, req.Query, vs.buildKeywordSearchQuery)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+		Hybrid: isearch.NewHybridBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				result, err := vs.searchWithBuilder(ctx, req.Query, vs.buildHybridSearchQuery)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+		Filter: isearch.NewFilterBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				result, err := vs.searchWithBuilder(ctx, req.Query, vs.buildFilterSearchQuery)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+	}
+
+	return isearch.Run(ctx, modePipeline, &effectiveQuery)
+}
+
+func (vs *VectorStore) searchWithBuilder(
+	ctx context.Context,
+	query *vectorstore.SearchQuery,
+	build func(*vectorstore.SearchQuery) (*types.SearchRequestBody, error),
+) (*vectorstore.SearchResult, error) {
+	searchQuery, err := build(query)
 	if err != nil {
 		return nil, fmt.Errorf("elasticsearch build search query: %w", err)
 	}
-
-	// Execute search.
 	data, err := vs.search(ctx, vs.option.indexName, searchQuery)
 	if err != nil {
 		return nil, fmt.Errorf("elasticsearch search: %w", err)
 	}
-
-	// Parse search results.
 	return vs.parseSearchResults(data)
 }
 

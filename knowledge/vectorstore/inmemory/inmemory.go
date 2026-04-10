@@ -20,9 +20,11 @@ import (
 	"sync"
 	"time"
 
+	"trpc.group/trpc-go/trpc-agent-go/internal/retrieval"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/document"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/searchfilter"
 	"trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore"
+	isearch "trpc.group/trpc-go/trpc-agent-go/knowledge/vectorstore/internal/search"
 )
 
 var (
@@ -191,30 +193,78 @@ func (vs *VectorStore) Search(ctx context.Context, query *vectorstore.SearchQuer
 		return nil, errors.New("query cannot be nil")
 	}
 
-	// Handle different search modes
-	switch query.SearchMode {
-	case vectorstore.SearchModeVector:
-		return vs.searchByVector(ctx, query)
-	case vectorstore.SearchModeFilter:
-		return vs.searchByFilter(ctx, query)
-	case vectorstore.SearchModeHybrid:
-		// For in-memory implementation, hybrid mode falls back to vector search
-		// since we don't have full-text search capabilities
-		if len(query.Vector) == 0 {
-			return nil, fmt.Errorf("query vector cannot be empty for hybrid search")
-		}
-		return vs.searchByVector(ctx, query)
-	case vectorstore.SearchModeKeyword:
-		// For in-memory implementation, keyword search is not supported
-		// Fall back to filter search
-		return vs.searchByFilter(ctx, query)
+	effectiveQuery := *query
+	switch effectiveQuery.SearchMode {
+	case vectorstore.SearchModeVector,
+		vectorstore.SearchModeFilter,
+		vectorstore.SearchModeHybrid,
+		vectorstore.SearchModeKeyword:
 	default:
-		// Default behavior: require vector for backward compatibility
-		if len(query.Vector) == 0 {
+		if len(effectiveQuery.Vector) == 0 {
 			return nil, fmt.Errorf("query vector cannot be empty")
 		}
-		return vs.searchByVector(ctx, query)
+		effectiveQuery.SearchMode = vectorstore.SearchModeVector
 	}
+
+	modePipeline := &isearch.ModePipeline{
+		Vector: isearch.NewVectorBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				result, err := vs.searchByVector(ctx, req.Query)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+		Filter: isearch.NewFilterBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				result, err := vs.searchByFilter(ctx, req.Query)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+		Hybrid: isearch.NewHybridBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				if len(req.Query.Vector) == 0 {
+					return nil, fmt.Errorf("query vector cannot be empty for hybrid search")
+				}
+				result, err := vs.searchByVector(ctx, req.Query)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+		Keyword: isearch.NewKeywordBranch(
+			retrieval.ChannelFunc[isearch.Request, *vectorstore.ScoredDocument](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*vectorstore.ScoredDocument], error) {
+				result, err := vs.searchByFilter(ctx, req.Query)
+				if err != nil {
+					return nil, err
+				}
+				return isearch.HitsFromSearchResult(result), nil
+			}),
+			isearch.TopKPostprocessor{},
+		),
+	}
+
+	return isearch.Run(ctx, modePipeline, &effectiveQuery)
 }
 
 // searchByVector performs vector similarity search

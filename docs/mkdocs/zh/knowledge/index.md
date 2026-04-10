@@ -23,6 +23,8 @@ Knowledge 系统的使用遵循以下模式：
 - **知识过滤**：通过元数据，支持知识的静态过滤和 Agent 智能过滤
 - **可扩展架构**：支持自定义 Embedder、Retriever 和 Reranker
 
+如果想看检索链路在当前代码里的分层和职责边界，可以直接看[检索分层](retrieval.md)。
+
 ### Agent 集成
 
 Knowledge 系统与 Agent 的集成方式：

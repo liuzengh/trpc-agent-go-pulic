@@ -23,8 +23,10 @@ import (
 	"sync"
 	"time"
 
+	"trpc.group/trpc-go/trpc-agent-go/internal/retrieval"
 	"trpc.group/trpc-go/trpc-agent-go/memory"
 	imemory "trpc.group/trpc-go/trpc-agent-go/memory/internal/memory"
+	isearch "trpc.group/trpc-go/trpc-agent-go/memory/internal/search"
 	"trpc.group/trpc-go/trpc-agent-go/session"
 	"trpc.group/trpc-go/trpc-agent-go/tool"
 )
@@ -692,70 +694,133 @@ func (s *Service) SearchMemories(
 	if err != nil {
 		return nil, err
 	}
-
 	limit := resolveSearchLimit(s.opts.maxResults, searchOpts.MaxResults)
-	results := applySearchFilters(candidates, searchOpts)
-	if searchOpts.Kind != "" &&
-		searchOpts.KindFallback &&
-		len(results) < imemory.MinKindFallbackResults {
-		fallbackOpts := searchOpts
-		fallbackOpts.Kind = ""
-		fallbackOpts.KindFallback = false
-		fallbackResults := applySearchFilters(candidates, fallbackOpts)
-		if len(fallbackResults) > 0 {
-			results = imemory.MergeSearchResults(
-				results, fallbackResults, searchOpts.Kind, limit,
-			)
-		}
+	request := isearch.Request{
+		UserKey: userKey,
+		Options: searchOpts,
 	}
-	if searchOpts.HybridSearch {
-		keywordResults, kwErr := s.executeKeywordSearch(
-			ctx,
-			userKey,
-			searchOpts,
+
+	denseBranch := isearch.NewDenseBranch(
+		retrieval.ChannelFunc[isearch.Request, *memory.Entry](func(
+			_ context.Context,
+			req isearch.Request,
+		) ([]retrieval.Hit[*memory.Entry], error) {
+			return isearch.HitsFromEntries(
+				applySearchFilters(candidates, req.Options),
+			), nil
+		}),
+	)
+
+	postprocessors := []retrieval.Postprocessor[isearch.Request, *memory.Entry]{
+		isearch.ThresholdPostprocessor{
+			SimilarityThreshold: searchOpts.SimilarityThreshold,
+			Skip:                searchOpts.HybridSearch,
+		},
+	}
+	if searchOpts.Kind != "" && searchOpts.KindFallback {
+		postprocessors = append(postprocessors,
+			isearch.KindPrioritySortPostprocessor{
+				PreferredKind:    searchOpts.Kind,
+				OrderByEventTime: searchOpts.OrderByEventTime,
+			},
 		)
-		if kwErr == nil && len(keywordResults) > 0 {
-			rrfK := searchOpts.HybridRRFK
-			if rrfK <= 0 {
-				rrfK = imemory.DefaultHybridRRFK
-			}
-			results = imemory.MergeHybridResults(
-				results,
-				keywordResults,
-				rrfK,
-				limit,
-			)
-		}
+	} else {
+		postprocessors = append(postprocessors, isearch.SortPostprocessor{
+			OrderByEventTime: searchOpts.OrderByEventTime,
+		})
 	}
-	if searchOpts.SimilarityThreshold > 0 &&
-		len(results) > 0 &&
-		!searchOpts.HybridSearch {
-		filtered := results[:0]
-		for _, entry := range results {
-			if entry.Score >= searchOpts.SimilarityThreshold {
-				filtered = append(filtered, entry)
-			}
-		}
-		results = filtered
+	postprocessors = append(postprocessors,
+		isearch.DeduplicatePostprocessor{
+			DeduplicateFunc: imemory.DeduplicateResults,
+		},
+		isearch.TopKPostprocessor{MaxResults: limit},
+	)
+
+	var pipeline retrieval.Pipeline[isearch.Request, *memory.Entry] = denseBranch
+	if searchOpts.Kind != "" && searchOpts.KindFallback {
+		pipeline = isearch.NewKindFallbackPipeline(
+			denseBranch,
+			denseBranch,
+			isearch.KindFallbackPolicy{MinResults: imemory.MinKindFallbackResults},
+			isearch.KindFallbackMerger{
+				MaxResults: limit,
+				MergeFunc:  imemory.MergeSearchResults,
+			},
+		)
 	}
-	if len(results) > 1 {
-		if searchOpts.Kind != "" && searchOpts.KindFallback {
-			imemory.SortSearchResultsWithKindPriority(
-				results,
-				searchOpts.Kind,
-				searchOpts.OrderByEventTime,
-			)
-		} else {
-			imemory.SortSearchResults(results, searchOpts.OrderByEventTime)
-		}
+
+	if searchOpts.HybridSearch {
+		keywordBranch := isearch.NewKeywordBranch(
+			retrieval.ChannelFunc[isearch.Request, *memory.Entry](func(
+				ctx context.Context,
+				req isearch.Request,
+			) ([]retrieval.Hit[*memory.Entry], error) {
+				candidateLimit, limitErr := s.resolveSearchCandidateLimit(
+					ctx,
+					req.UserKey,
+					req.Options,
+				)
+				if limitErr != nil {
+					return []retrieval.Hit[*memory.Entry]{}, nil
+				}
+				hits, recallErr := (isearch.KeywordChannel{
+					Entries: func(
+						ctx context.Context,
+						req isearch.Request,
+					) ([]*memory.Entry, error) {
+						return s.ReadMemories(ctx, req.UserKey, 0)
+					},
+					SearchFunc:        imemory.SearchEntries,
+					MinScore:          imemory.DefaultSearchMinScore,
+					DefaultMaxResults: candidateLimit,
+					PrepareOptions: func(req isearch.Request) memory.SearchOptions {
+						keywordOpts := req.Options
+						keywordOpts.OrderByEventTime = false
+						keywordOpts.KindFallback = false
+						keywordOpts.Deduplicate = false
+						keywordOpts.HybridSearch = false
+						keywordOpts.SimilarityThreshold = 0
+						keywordOpts.MaxResults = candidateLimit
+						return keywordOpts
+					},
+				}).Recall(ctx, req)
+				if recallErr != nil {
+					return []retrieval.Hit[*memory.Entry]{}, nil
+				}
+				return hits, nil
+			}),
+		)
+		pipeline = isearch.NewHybridPipeline(
+			[]retrieval.NamedPipeline[isearch.Request, *memory.Entry]{
+				{Name: "dense", Pipeline: pipeline},
+				{Name: "keyword", Pipeline: keywordBranch},
+			},
+			isearch.RRFFusion{
+				K:          searchOpts.HybridRRFK,
+				MaxResults: limit,
+				FuseFunc: func(
+					primary []*memory.Entry,
+					secondary []*memory.Entry,
+					k int,
+					maxResults int,
+				) []*memory.Entry {
+					if len(secondary) == 0 {
+						return primary
+					}
+					return imemory.MergeHybridResults(primary, secondary, k, maxResults)
+				},
+			},
+			postprocessors...,
+		)
+	} else if fallbackPipeline, ok := pipeline.(*retrieval.FallbackPipeline[
+		isearch.Request, *memory.Entry,
+	]); ok {
+		fallbackPipeline.Post = postprocessors
+	} else {
+		denseBranch.Post = postprocessors
 	}
-	if searchOpts.Deduplicate && len(results) > 1 {
-		results = imemory.DeduplicateResults(results)
-	}
-	if limit > 0 && len(results) > limit {
-		results = results[:limit]
-	}
-	return results, nil
+
+	return isearch.Run(ctx, pipeline, request)
 }
 
 func scanEntry(

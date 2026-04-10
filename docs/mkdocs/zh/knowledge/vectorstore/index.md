@@ -79,6 +79,8 @@ for i, r := range rspSearchWithFilter.Documents {
 
 所有向量存储都支持过滤器功能，包括 ID 过滤、元数据过滤和复杂条件过滤（`FilterCondition`）。
 
+如果想看 `VectorStore.Search()` 和 backend `searchBy*` 之间那层 mode-routing 是怎么组织的，可以看[检索分层](../retrieval.md)。
+
 ## 更多内容
 
 - [Memory](inmemory.md) - 内存向量存储配置

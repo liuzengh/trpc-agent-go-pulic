@@ -39,6 +39,7 @@ nav:
           - Overview: knowledge/index.md
           - Embedder: knowledge/embedder.md
           - Reranker: knowledge/reranker.md
+          - Retrieval: knowledge/retrieval.md
           - Source: knowledge/source.md
           - Filter: knowledge/filter.md
           - Management: knowledge/management.md
@@ -111,6 +112,7 @@ plugins:
                     - 概述: knowledge/index.md
                     - Embedder: knowledge/embedder.md
                     - Reranker: knowledge/reranker.md
+                    - 检索分层: knowledge/retrieval.md
                     - 数据源: knowledge/source.md
                     - 过滤器: knowledge/filter.md
                     - 知识库管理: knowledge/management.md
