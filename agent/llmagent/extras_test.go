@@ -16,8 +16,12 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	tracesdk "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	"go.opentelemetry.io/otel/trace/noop"
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
@@ -257,6 +261,46 @@ func TestLLMAgent_AfterCbErrorRecordsTelemetryErrorType(t *testing.T) {
 	))
 }
 
+func TestLLMAgent_TerminalErrorEventWithoutFullResponseMarksSpan(t *testing.T) {
+	spanRecorder := tracetest.NewSpanRecorder()
+	tp := tracesdk.NewTracerProvider(tracesdk.WithSpanProcessor(spanRecorder))
+	t.Cleanup(func() {
+		_ = tp.Shutdown(context.Background())
+	})
+
+	ctx, span := tp.Tracer("test").Start(context.Background(), "wrap")
+	inv := &agent.Invocation{InvocationID: "id", AgentName: "agent"}
+	var trackerErr error
+	tracker := itelemetry.NewInvokeAgentTracker(ctx, inv, false, &trackerErr)
+	orig := make(chan *event.Event, 1)
+	code := "429"
+	orig <- &event.Event{
+		Response: &model.Response{
+			IsPartial: true,
+			Error: &model.ResponseError{
+				Type:    "rate_limit",
+				Code:    &code,
+				Message: "rate limited",
+			},
+		},
+	}
+	close(orig)
+
+	llm := &LLMAgent{}
+	wrapped := llm.wrapEventChannelWithTelemetry(ctx, inv, orig, span, tracker, true)
+
+	var events []*event.Event
+	for e := range wrapped {
+		events = append(events, e)
+	}
+	require.Len(t, events, 1)
+
+	spans := spanRecorder.Ended()
+	require.Len(t, spans, 1)
+	require.Equal(t, codes.Error, spans[0].Status().Code)
+	require.True(t, hasSpanAttribute(spans[0].Attributes(), semconvtrace.KeyErrorType, "rate_limit_429"))
+}
+
 func hasInvokeAgentMetricStringAttribute(
 	rm metricdata.ResourceMetrics,
 	metricName string,
@@ -279,6 +323,15 @@ func hasInvokeAgentMetricStringAttribute(
 					}
 				}
 			}
+		}
+	}
+	return false
+}
+
+func hasSpanAttribute(attrs []attribute.KeyValue, key string, value string) bool {
+	for _, attr := range attrs {
+		if string(attr.Key) == key && attr.Value.AsString() == value {
+			return true
 		}
 	}
 	return false
