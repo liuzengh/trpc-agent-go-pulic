@@ -23,7 +23,8 @@
 
 | 指标名 | 指标语义 | 指标类型 | 单位 | 上报时机 |
 | --- | --- | --- | --- | --- |
-| `gen_ai.client.operation.duration` | graph workflow/node 执行耗时 | histogram | 秒 | graph node 执行完成或执行失败时上报一次 |
+| `gen_ai.client.operation.duration` | graph workflow/node 执行耗时（节点耗时） | histogram | 秒 | graph node 执行完成或执行失败时上报一次 |
+| `gen_ai.workflow.path.duration` | graph start 到 node 完成的路径耗时 | histogram | 秒 | graph node 执行完成或执行失败时上报一次 |
 
 `histogram` 用于支持平均值、p95、p99 等聚合统计。
 
@@ -95,3 +96,25 @@
 - app/user 维度统一使用 `gen_ai.*` 命名，即 `gen_ai.app.name`、`gen_ai.user.id`。
 - cache hit、retry attempt 不作为维度。
 - `gen_ai.system` 允许为空；有模型信息时优先使用模型 system。
+
+## 路径耗时补充说明
+
+### 背景
+
+在 PR review 讨论中明确了两种耗时口径的需求：
+
+- **节点耗时** (`gen_ai.client.operation.duration`)：从当前 node start 到该 node complete/error，反映单个节点自身的执行效率。
+- **路径耗时** (`gen_ai.workflow.path.duration`)：从 graph 开始执行（start 节点）到某个 node 完成的累计耗时，反映用户视角的端到端延迟分布。
+
+### 使用场景
+
+- **定位首包慢**：通过路径耗时可以直观看到用户发起请求后，到第一个有效输出之间经过了哪些节点、总共花了多久。
+- **对比节点在链路中的位置影响**：同一个节点在不同 graph 路径中的路径耗时不同，有助于发现前置节点的瓶颈。
+- **p95/p99 分位值**：histogram 类型支持在监控平台聚合统计，用于 SLA 分析。
+
+### 设计决策
+
+- 两个指标共享**相同的维度**（`gen_ai.workflow.*`、`gen_ai.agent.*` 等），不增加额外维度。
+- 路径耗时从 `ExecutionContext.StartTime`（graph executor 入口 `Execute()` 创建时间）计算。
+- 节点完成时同步上报两个指标（一次 `record()` 调用中完成），保证原子性。
+- 若 `graphStart` 为零值（如非标准入口），则跳过路径耗时上报。

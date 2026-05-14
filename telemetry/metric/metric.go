@@ -226,6 +226,11 @@ func setWorkflowHistogramBuckets(metricName string, boundaries []float64) error 
 			return fmt.Errorf("workflow metric %s not initialized", metricName)
 		}
 		return itelemetry.WorkflowMetricGenAIClientOperationDuration.SetBuckets(boundaries)
+	case metrics.MetricGenAIWorkflowPathDuration:
+		if itelemetry.WorkflowMetricGenAIWorkflowPathDuration == nil {
+			return fmt.Errorf("workflow metric %s not initialized", metricName)
+		}
+		return itelemetry.WorkflowMetricGenAIWorkflowPathDuration.SetBuckets(boundaries)
 	default:
 		return fmt.Errorf("unknown or unsupported workflow histogram metric: %s", metricName)
 	}
@@ -293,6 +298,15 @@ func initWorkflowMetrics(mp metric.MeterProvider) error {
 		metric.WithUnit("s"),
 	); err != nil {
 		return fmt.Errorf("failed to create %s metric %s: %w", meterName, metrics.MetricGenAIClientOperationDuration, err)
+	}
+	if itelemetry.WorkflowMetricGenAIWorkflowPathDuration, err = histogram.NewDynamicFloat64Histogram(
+		mp,
+		metrics.MeterNameWorkflow,
+		metrics.MetricGenAIWorkflowPathDuration,
+		metric.WithDescription("Duration from graph start to node completion"),
+		metric.WithUnit("s"),
+	); err != nil {
+		return fmt.Errorf("failed to create %s metric %s: %w", meterName, metrics.MetricGenAIWorkflowPathDuration, err)
 	}
 
 	return nil

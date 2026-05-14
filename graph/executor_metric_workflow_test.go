@@ -176,6 +176,7 @@ func setupWorkflowMetricReader(t *testing.T) (*sdkmetric.ManualReader, func()) {
 	originalProvider := itelemetry.MeterProvider
 	originalMeter := itelemetry.WorkflowMeter
 	originalDuration := itelemetry.WorkflowMetricGenAIClientOperationDuration
+	originalPathDuration := itelemetry.WorkflowMetricGenAIWorkflowPathDuration
 
 	itelemetry.MeterProvider = provider
 	itelemetry.WorkflowMeter = provider.Meter(semconvmetrics.MeterNameWorkflow)
@@ -186,11 +187,18 @@ func setupWorkflowMetricReader(t *testing.T) (*sdkmetric.ManualReader, func()) {
 		semconvmetrics.MetricGenAIClientOperationDuration,
 	)
 	require.NoError(t, err)
+	itelemetry.WorkflowMetricGenAIWorkflowPathDuration, err = histogram.NewDynamicFloat64Histogram(
+		provider,
+		semconvmetrics.MeterNameWorkflow,
+		semconvmetrics.MetricGenAIWorkflowPathDuration,
+	)
+	require.NoError(t, err)
 
 	return reader, func() {
 		itelemetry.MeterProvider = originalProvider
 		itelemetry.WorkflowMeter = originalMeter
 		itelemetry.WorkflowMetricGenAIClientOperationDuration = originalDuration
+		itelemetry.WorkflowMetricGenAIWorkflowPathDuration = originalPathDuration
 	}
 }
 
@@ -249,4 +257,125 @@ func workflowPointHasAttrKey(point metricdata.HistogramDataPoint[float64], key s
 		}
 	}
 	return false
+}
+
+func collectWorkflowPathMetricPoints(
+	t *testing.T,
+	reader *sdkmetric.ManualReader,
+) []metricdata.HistogramDataPoint[float64] {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(context.Background(), &rm))
+	for _, scopeMetric := range rm.ScopeMetrics {
+		for _, metric := range scopeMetric.Metrics {
+			if metric.Name != semconvmetrics.MetricGenAIWorkflowPathDuration {
+				continue
+			}
+			hist, ok := metric.Data.(metricdata.Histogram[float64])
+			require.True(t, ok)
+			return hist.DataPoints
+		}
+	}
+	return nil
+}
+
+func TestWorkflowPathMetricRecordsOnSuccess(t *testing.T) {
+	reader, cleanup := setupWorkflowMetricReader(t)
+	defer cleanup()
+
+	sg := NewStateGraph(NewStateSchema())
+	sg.AddNode("work", func(ctx context.Context, state State) (any, error) {
+		time.Sleep(10 * time.Millisecond)
+		return State{"ok": true}, nil
+	}).SetEntryPoint("work").SetFinishPoint("work")
+	exec := compileExecutorForWorkflowMetric(t, sg)
+
+	inv := agent.NewInvocation(
+		agent.WithInvocationID("inv-path-metric-success"),
+		agent.WithInvocationSession(&session.Session{AppName: "test-app", UserID: "user-1"}),
+	)
+	ch, err := exec.Execute(context.Background(), State{}, inv)
+	require.NoError(t, err)
+	drainWorkflowEvents(ch)
+
+	// Verify node duration is recorded.
+	nodePts := collectWorkflowMetricPoints(t, reader)
+	require.Len(t, nodePts, 1)
+
+	// Verify path duration is recorded.
+	pathPts := collectWorkflowPathMetricPoints(t, reader)
+	require.Len(t, pathPts, 1)
+	require.Equal(t, uint64(1), pathPts[0].Count)
+	// Path duration >= node duration.
+	require.GreaterOrEqual(t, pathPts[0].Sum, nodePts[0].Sum)
+	require.True(t, workflowPointHasAttr(pathPts[0], semconvtrace.KeyGenAIWorkflowID, "work"))
+	require.True(t, workflowPointHasAttr(pathPts[0], semconvtrace.KeyGenAIAppName, "test-app"))
+	require.False(t, workflowPointHasAttrKey(pathPts[0], semconvtrace.KeyErrorType))
+}
+
+func TestWorkflowPathMetricRecordsOnFailure(t *testing.T) {
+	reader, cleanup := setupWorkflowMetricReader(t)
+	defer cleanup()
+
+	sg := NewStateGraph(NewStateSchema())
+	sg.AddNode("fail", func(ctx context.Context, state State) (any, error) {
+		return nil, fmt.Errorf("boom")
+	}).SetEntryPoint("fail").SetFinishPoint("fail")
+	exec := compileExecutorForWorkflowMetric(t, sg)
+
+	ch, err := exec.Execute(context.Background(), State{}, agent.NewInvocation(
+		agent.WithInvocationID("inv-path-metric-failure"),
+	))
+	require.NoError(t, err)
+	drainWorkflowEvents(ch)
+
+	pathPts := collectWorkflowPathMetricPoints(t, reader)
+	require.Len(t, pathPts, 1)
+	require.Equal(t, uint64(1), pathPts[0].Count)
+	require.True(t, workflowPointHasAttr(pathPts[0], semconvtrace.KeyGenAIWorkflowID, "fail"))
+	require.True(t, workflowPointHasAttr(pathPts[0], semconvtrace.KeyErrorType, semconvtrace.ValueDefaultErrorType))
+}
+
+func TestWorkflowPathMetricMultipleNodes(t *testing.T) {
+	reader, cleanup := setupWorkflowMetricReader(t)
+	defer cleanup()
+
+	sg := NewStateGraph(NewStateSchema())
+	var step1Done, step2Done atomic.Int64
+	sg.AddNode("step1", func(ctx context.Context, state State) (any, error) {
+		time.Sleep(20 * time.Millisecond)
+		step1Done.Store(time.Now().UnixMilli())
+		return State{"step1": true}, nil
+	})
+	sg.AddNode("step2", func(ctx context.Context, state State) (any, error) {
+		time.Sleep(20 * time.Millisecond)
+		step2Done.Store(time.Now().UnixMilli())
+		return State{"step2": true}, nil
+	})
+	sg.SetEntryPoint("step1")
+	sg.AddEdge("step1", "step2")
+	sg.SetFinishPoint("step2")
+	exec := compileExecutorForWorkflowMetric(t, sg)
+
+	ch, err := exec.Execute(context.Background(), State{}, agent.NewInvocation(
+		agent.WithInvocationID("inv-path-metric-multi"),
+	))
+	require.NoError(t, err)
+	drainWorkflowEvents(ch)
+
+	pathPts := collectWorkflowPathMetricPoints(t, reader)
+	require.Len(t, pathPts, 2)
+
+	// Find path durations for each node.
+	var step1Path, step2Path float64
+	for _, pt := range pathPts {
+		if workflowPointHasAttr(pt, semconvtrace.KeyGenAIWorkflowID, "step1") {
+			step1Path = pt.Sum
+		}
+		if workflowPointHasAttr(pt, semconvtrace.KeyGenAIWorkflowID, "step2") {
+			step2Path = pt.Sum
+		}
+	}
+	// step2's path duration should be > step1's path duration (serial execution).
+	require.Greater(t, step2Path, step1Path)
 }
