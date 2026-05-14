@@ -26,6 +26,9 @@ var (
 
 	// WorkflowMetricGenAIClientOperationDuration records graph workflow/node execution durations in seconds.
 	WorkflowMetricGenAIClientOperationDuration *histogram.DynamicFloat64Histogram
+
+	// WorkflowMetricGenAIWorkflowPathDuration records the duration from graph start to node completion in seconds.
+	WorkflowMetricGenAIWorkflowPathDuration *histogram.DynamicFloat64Histogram
 )
 
 // WorkflowAttributes is the attributes for workflow execution metrics.
@@ -70,6 +73,18 @@ func ReportWorkflowMetrics(ctx context.Context, attrs WorkflowAttributes, durati
 		return
 	}
 	WorkflowMetricGenAIClientOperationDuration.Record(
+		ctx,
+		duration.Seconds(),
+		metric.WithAttributes(attrs.toAttributes()...),
+	)
+}
+
+// ReportWorkflowPathMetrics reports the workflow path duration metrics (graph start to node completion).
+func ReportWorkflowPathMetrics(ctx context.Context, attrs WorkflowAttributes, duration time.Duration) {
+	if WorkflowMetricGenAIWorkflowPathDuration == nil {
+		return
+	}
+	WorkflowMetricGenAIWorkflowPathDuration.Record(
 		ctx,
 		duration.Seconds(),
 		metric.WithAttributes(attrs.toAttributes()...),

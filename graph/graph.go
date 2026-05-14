@@ -16,6 +16,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"trpc.group/trpc-go/trpc-agent-go/agent"
 	"trpc.group/trpc-go/trpc-agent-go/event"
@@ -481,6 +482,8 @@ type ExecutionContext struct {
 	Graph        *Graph
 	EventChan    chan<- *event.Event
 	InvocationID string
+	// StartTime is the graph execution start time, used for path duration metrics.
+	StartTime time.Time
 	// Invocation is the per-run invocation context. Nodes may use it to
 	// read invocation-scoped state (for example, {invocation:*} placeholders).
 	Invocation *agent.Invocation
