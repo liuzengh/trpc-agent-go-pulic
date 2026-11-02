@@ -2,6 +2,8 @@
 
 This example demonstrates a minimal multi-turn chat interface using the `Runner` orchestration component. It focuses on core functionality with an in-memory session backend, making it easy to understand and run.
 
+See [`emptyresponsemodel/`](emptyresponsemodel/) for bounded empty-response retries using an application-owned `model.Model` wrapper, including session-history checks and an opt-in live smoke test.
+
 ## What is Multi-turn Chat?
 
 This implementation showcases the essential features for building conversational AI applications:
